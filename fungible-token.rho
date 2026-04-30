@@ -1,0 +1,88 @@
+// ============================================================================
+// Simple Fungible Token — ASI:Chain DevNet (Rholang)
+// ============================================================================
+//
+// INVARIANTS:
+//   1. balances channel always has exactly 1 message (the map)
+//   2. Conservation: transfer never creates or destroys tokens
+//
+// OCAP BOUNDARIES:
+//   - Token channel: public (exposed on @"simple_ft_v1")
+//   - balances: private (inside new block)
+
+new Token in {
+  new balances in {
+    // Initialize empty balances map
+    balances!({}) |
+
+    // ---- mint: create new tokens for an address ----
+    // @addr: quoting because we want the address VALUE
+    // @amount: quoting because we want the numeric VALUE
+    // *ack: unquoting because caller needs to RECEIVE on this channel
+    contract Token(@"mint", @addr, @amount, ack) = {
+      for (@bals <- balances) {
+        // LINEARITY: bals consumed — MUST write back on ALL paths
+        match bals.contains(addr) {
+          true  => {
+            balances!(bals.set(addr, bals.get(addr) + amount)) |
+            ack!("ok")
+          }
+          false => {
+            balances!(bals.set(addr, amount)) |
+            ack!("ok")
+          }
+        }
+      }
+    } |
+
+    // ---- transfer: move tokens between addresses ----
+    contract Token(@"transfer", @from, @to, @amount, ack) = {
+      for (@bals <- balances) {
+        match bals.contains(from) {
+          false => {
+            // RESTORE on error
+            balances!(bals) | ack!("error: sender not found")
+          }
+          true  => {
+            match bals.get(from) >= amount {
+              false => {
+                // RESTORE on error
+                balances!(bals) | ack!("error: insufficient balance")
+              }
+              true  => {
+                match bals.contains(to) {
+                  false => {
+                    // PROOF: get(from) - amount + amount = get(from). Conservation holds.
+                    balances!(bals.set(from, bals.get(from) - amount).set(to, amount)) |
+                    ack!("ok")
+                  }
+                  true  => {
+                    // PROOF: (get(from) - amount) + (get(to) + amount) = get(from) + get(to).
+                    balances!(bals.set(from, bals.get(from) - amount).set(to, bals.get(to) + amount)) |
+                    ack!("ok")
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // ---- balance: read-only query ----
+    contract Token(@"balance", @addr, ack) = {
+      for (@bals <- balances) {
+        // RESTORE immediately — read-only operation
+        balances!(bals) |
+        match bals.contains(addr) {
+          false => { ack!(0) }
+          true  => { ack!(bals.get(addr)) }
+        }
+      }
+    } |
+
+    // Expose Token on a public channel so other deploys can use it
+    // *Token: unquoting because we send the channel itself
+    @"simple_ft_v1"!(*Token)
+  }
+}
