@@ -1,0 +1,21 @@
+{
+  "network": "asi-chain-devnet",
+  "contract": "ASI Sample Token (ASIS)",
+  "deployId": "304402202e3bb185fd7b1a05959f8ddc98b02fcabe33153acfe6f9eef7ba39a6704d629302201e95bf97d1da20a64e1d4a9a6b06611937f45589d9aed05a05cc615dc6bb494a",
+  "blockNumber": "375064",
+  "blockHash": "4075660ee0f2e93775ba1d8037a116be31db41f5493f1ad5ac5d1feef2ed8512",
+  "errored": false,
+  "errorMessage": null,
+  "status": "confirmed",
+  "explorerUrl": "https://explorer.dev.asichain.io/transaction/304402202e3bb185fd7b1a05959f8ddc98b02fcabe33153acfe6f9eef7ba39a6704d629302201e95bf97d1da20a64e1d4a9a6b06611937f45589d9aed05a05cc615dc6bb494a",
+  "tokenChannelName": "@\"asi_stoken_v1\"",
+  "verification": {
+    "method": "ASI:Chain GraphQL indexer",
+    "endpoint": "https://indexer.dev.asichain.io/v1/graphql",
+    "query": "query { deployments(where: {deploy_id: {_eq: \"<id>\"}}) { deploy_id errored error_message block_number block_hash } }"
+  },
+  "notes": {
+    "tokenFacetUri": "Logged at deploy-time as (\"TokenFacetURI\", rho:id:...). Also discoverable via @\"asi_stoken_v1\" from any deploy on ASI:Chain DevNet.",
+    "adminFacetUri": "Logged at deploy-time as (\"AdminFacetURI\", rho:id:...). Not recovered from this deploy — validator stdout is not exposed by the current DevNet infrastructure."
+  }
+}

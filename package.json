@@ -1,9 +1,18 @@
 {
-  "name": "asi-chain-simple-dapp",
+  "name": "asi-sample-token",
+  "version": "1.0.0",
+  "description": "ASI Sample Token (ASIS) — a production-grade Rholang fungible token for ASI:Chain DevNet, built with the Matterhorn IDE.",
   "type": "module",
   "private": true,
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "deploy": "node deploy.mjs"
+  },
   "dependencies": {
     "@noble/curves": "^1.8.0",
     "@noble/hashes": "^1.7.0"
-  }
+  },
+  "license": "MIT"
 }

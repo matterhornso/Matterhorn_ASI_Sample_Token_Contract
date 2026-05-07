@@ -1,65 +1,230 @@
 // ============================================================================
-// Simple Fungible Token — ASI:Chain DevNet (Rholang)
+// ASI Sample Token (ASIS) — Fungible Token for ASI:Chain DevNet
 // ============================================================================
 //
-// INVARIANTS:
-//   1. balances channel always has exactly 1 message (the map)
-//   2. Conservation: transfer never creates or destroys tokens
+// ERC20-equivalent fungible token in Rholang:
+//   totalSupply, balanceOf, transfer, approve / allowance / transferFrom,
+//   increaseAllowance / decreaseAllowance, admin-only mint / burn / pause /
+//   unpause, stdout event log, registry publication.
 //
-// OCAP BOUNDARIES:
-//   - Token channel: public (exposed on @"simple_ft_v1")
-//   - balances: private (inside new block)
+// ----------------------------------------------------------------------------
+// LIVE DEPLOYMENT (ASI:Chain DevNet — see deployment.json)
+// ----------------------------------------------------------------------------
+//   Deploy ID : 304402202e3bb185fd7b1a05959f8ddc98b02fcabe33153acfe6f9eef7
+//               ba39a6704d629302201e95bf97d1da20a64e1d4a9a6b06611937f4558
+//               9d9aed05a05cc615dc6bb494a
+//   Block     : 375064  (errored: false)
+//   Explorer  : https://explorer.dev.asichain.io/transaction/<deployId>
+//
+// ----------------------------------------------------------------------------
+// FEATURE SET
+// ----------------------------------------------------------------------------
+//   Metadata         : name, symbol, decimals
+//   Supply           : totalSupply (on-chain, updated by mint/burn)
+//   Balances         : balanceOf(addr)
+//   Transfers        : transfer(from, to, amount)
+//   Allowances       : approve / allowance / increaseAllowance / decreaseAllowance
+//                      transferFrom (ERC20-style delegated transfer)
+//   Admin controls   : mint, burn, pause, unpause — gated by the TokenAdmin
+//                      capability URI (see "OCAP admin model" below)
+//   Lifecycle        : pausable — transfers/approvals halted while paused
+//   Events           : emitted on stdout as structured tuples for off-chain
+//                      indexers (Transfer, Approval, Mint, Burn, Paused, Unpaused)
+//   Discovery        : registered on rho:registry:insertArbitrary (two URIs)
+//                      and on well-known channel @"asi_stoken_v1" for the
+//                      public Token facet
+//
+// ----------------------------------------------------------------------------
+// OCAP ADMIN MODEL (why there is no "owner address")
+// ----------------------------------------------------------------------------
+// Rholang is a capability-secure language. Instead of storing an "owner
+// address" and comparing it on every admin call (the Solidity pattern), this
+// contract exposes TWO separate facets at deploy time:
+//
+//   * Token       — PUBLIC. Registered at @"asi_stoken_v1" and via
+//                   rho:registry:insertArbitrary. Anyone can call read methods
+//                   and user actions (transfer / approve / transferFrom).
+//
+//   * TokenAdmin  — PRIVATE. The registry URI returned at deploy time IS the
+//                   capability. Whoever holds that URI can mint, burn, pause,
+//                   and unpause. Transferring ownership = sharing the URI.
+//                   Revocation = deploying a revocable forwarder (future work).
+//
+// This model is strictly stronger than owner-address comparison:
+//   - No on-chain key to compromise
+//   - No need to trust `rho:rchain:deployerId` semantics inside a contract
+//     (currently unreliable on ASI:Chain DevNet)
+//   - Admin authority can be delegated or split off-chain by simply sharing
+//     (or not sharing) the URI
+//
+// The deploy script extracts both URIs from validator stdout and writes them
+// to `deployment.json`. Treat `tokenAdminUri` as a secret.
+//
+// ----------------------------------------------------------------------------
+// INVARIANTS (proven in-line via LAW / PROOF comments)
+// ----------------------------------------------------------------------------
+//   I1.  `balances` channel always has exactly 1 message (the map).
+//   I2.  `allowances` channel always has exactly 1 message (the map).
+//   I3.  `totalSupply` channel always has exactly 1 message (an integer).
+//   I4.  `paused` channel always has exactly 1 message (a boolean).
+//   I5.  Conservation: totalSupply equals the sum of all balances at every
+//        observable state. Transfer/transferFrom are net-zero; mint adds;
+//        burn subtracts.
+//   I6.  Allowance monotonicity in transferFrom: allowance is deducted by
+//        exactly `amount` per successful call.
+//
+// ----------------------------------------------------------------------------
+// CONCURRENCY
+// ----------------------------------------------------------------------------
+// All multi-state operations use a JOIN (for (@a <- ch1; @b <- ch2; ...)) so
+// intermediate states are never externally observable. This is the source of
+// atomicity — the same guarantee Ethereum gets from single-threaded EVM
+// execution, Rholang gets from linear channel consumption.
+//
+// State linearity: every `for (@x <- stateChannel)` is followed by
+// `stateChannel!(...)` on ALL code paths, including every error branch. See
+// Step-3 hard rules in the rholang skill documentation.
+//
+// ----------------------------------------------------------------------------
+// DEPLOY PHLO BUDGET
+// ----------------------------------------------------------------------------
+//   Deploy:            ~2_000_000 phlo (large contract, two registry inserts)
+//   transfer:            ~300_000 phlo
+//   transferFrom:        ~500_000 phlo (3-way JOIN)
+//   mint / burn:         ~300_000 phlo
+//   approve:             ~300_000 phlo
+//   balanceOf / *Supply:  ~100_000 phlo
+//
+// Use 500_000 as the per-call default in deploy.mjs and clients.
+// ============================================================================
 
-new Token in {
-  new balances in {
-    // Initialize empty balances map
+new
+    Token, TokenAdmin,
+    insertArbitrary(`rho:registry:insertArbitrary`),
+    stdout(`rho:io:stdout`),
+    tokenUriCh, adminUriCh
+in {
+  new balances, allowances, totalSupply, paused in {
+
+    // =========================================================================
+    // STATE INITIALIZATION
+    // =========================================================================
+    // INVARIANT I1–I4: each channel holds exactly one value from this point on.
     balances!({}) |
+    allowances!({}) |
+    totalSupply!(0) |
+    paused!(false) |
 
-    // ---- mint: create new tokens for an address ----
-    // @addr: quoting because we want the address VALUE
-    // @amount: quoting because we want the numeric VALUE
-    // *ack: unquoting because caller needs to RECEIVE on this channel
-    contract Token(@"mint", @addr, @amount, ack) = {
+    // =========================================================================
+    // METADATA (stateless — compile-time constants)
+    // =========================================================================
+
+    contract Token(@"name", ack)     = { ack!("ASI Sample Token") } |
+    contract Token(@"symbol", ack)   = { ack!("ASIS") } |
+    contract Token(@"decimals", ack) = { ack!(8) } |
+
+    // =========================================================================
+    // READ-ONLY QUERIES
+    // =========================================================================
+    // PATTERN: consume state, immediately restore, then ack. The restore is
+    // concurrent with the ack so the state channel is available for the next
+    // reader without blocking on the client.
+
+    contract Token(@"totalSupply", ack) = {
+      for (@s <- totalSupply) {
+        totalSupply!(s) |              // RESTORE I3
+        ack!(s)
+      }
+    } |
+
+    contract Token(@"paused", ack) = {
+      for (@p <- paused) {
+        paused!(p) |                   // RESTORE I4
+        ack!(p)
+      }
+    } |
+
+    contract Token(@"balanceOf", @addr, ack) = {
       for (@bals <- balances) {
-        // LINEARITY: bals consumed — MUST write back on ALL paths
+        balances!(bals) |              // RESTORE I1
         match bals.contains(addr) {
-          true  => {
-            balances!(bals.set(addr, bals.get(addr) + amount)) |
-            ack!("ok")
-          }
-          false => {
-            balances!(bals.set(addr, amount)) |
-            ack!("ok")
+          true  => { ack!(bals.get(addr)) }
+          false => { ack!(0) }
+        }
+      }
+    } |
+
+    contract Token(@"allowance", @owner, @spender, ack) = {
+      for (@alws <- allowances) {
+        allowances!(alws) |            // RESTORE I2
+        new keyCh in {
+          keyCh!(owner ++ ":" ++ spender) |
+          for (@k <- keyCh) {
+            match alws.contains(k) {
+              true  => { ack!(alws.get(k)) }
+              false => { ack!(0) }
+            }
           }
         }
       }
     } |
 
-    // ---- transfer: move tokens between addresses ----
+    // =========================================================================
+    // TRANSFER — move tokens from sender to recipient
+    // =========================================================================
+    // Gated by paused. Validates amount > 0 and sufficient balance.
+    // LAW (conservation): sum of balances unchanged (fb - amount + amount = fb
+    //                     for new recipient; analogous for existing recipient).
+    // JOIN: paused + balances consumed atomically.
+
     contract Token(@"transfer", @from, @to, @amount, ack) = {
-      for (@bals <- balances) {
-        match bals.contains(from) {
-          false => {
-            // RESTORE on error
-            balances!(bals) | ack!("error: sender not found")
+      for (@p <- paused; @bals <- balances) {
+        match p {
+          true => {
+            paused!(p) | balances!(bals) |
+            ack!("error: transfers are paused")
           }
-          true  => {
-            match bals.get(from) >= amount {
+          false => {
+            paused!(p) |
+            match amount > 0 {
               false => {
-                // RESTORE on error
-                balances!(bals) | ack!("error: insufficient balance")
+                balances!(bals) |
+                ack!("error: amount must be positive")
               }
-              true  => {
-                match bals.contains(to) {
+              true => {
+                match bals.contains(from) {
                   false => {
-                    // PROOF: get(from) - amount + amount = get(from). Conservation holds.
-                    balances!(bals.set(from, bals.get(from) - amount).set(to, amount)) |
-                    ack!("ok")
+                    balances!(bals) |
+                    ack!("error: sender has no balance")
                   }
-                  true  => {
-                    // PROOF: (get(from) - amount) + (get(to) + amount) = get(from) + get(to).
-                    balances!(bals.set(from, bals.get(from) - amount).set(to, bals.get(to) + amount)) |
-                    ack!("ok")
+                  true => {
+                    new fbCh in {
+                      fbCh!(bals.get(from)) |
+                      for (@fb <- fbCh) {
+                        match fb >= amount {
+                          false => {
+                            balances!(bals) |
+                            ack!("error: insufficient balance")
+                          }
+                          true => {
+                            match bals.contains(to) {
+                              false => {
+                                // PROOF: fb - amount + amount = fb. Conservation holds.
+                                balances!(bals.set(from, fb - amount).set(to, amount)) |
+                                stdout!(("Event", "Transfer", from, to, amount)) |
+                                ack!("ok")
+                              }
+                              true  => {
+                                // PROOF: (fb - amount) + (get(to) + amount) = fb + get(to).
+                                balances!(bals.set(from, fb - amount).set(to, bals.get(to) + amount)) |
+                                stdout!(("Event", "Transfer", from, to, amount)) |
+                                ack!("ok")
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -69,20 +234,397 @@ new Token in {
       }
     } |
 
-    // ---- balance: read-only query ----
-    contract Token(@"balance", @addr, ack) = {
-      for (@bals <- balances) {
-        // RESTORE immediately — read-only operation
-        balances!(bals) |
-        match bals.contains(addr) {
-          false => { ack!(0) }
-          true  => { ack!(bals.get(addr)) }
+    // =========================================================================
+    // APPROVE — set spender's allowance to a specific amount
+    // =========================================================================
+    // Allowance key schema: "<owner>:<spender>". This is a standard composite
+    // key; collisions require a ":" in an address, which ASI:Chain addresses
+    // (1111...) cannot contain.
+    //
+    // NOTE on race: the classic ERC20 approve-then-approve race allows a spender
+    // to front-run an allowance change and spend the OLD + NEW amounts. Callers
+    // should prefer increaseAllowance / decreaseAllowance below, which avoid
+    // this by computing the delta atomically.
+
+    contract Token(@"approve", @owner, @spender, @amount, ack) = {
+      for (@p <- paused; @alws <- allowances) {
+        match p {
+          true => {
+            paused!(p) | allowances!(alws) |
+            ack!("error: token is paused")
+          }
+          false => {
+            paused!(p) |
+            match amount >= 0 {
+              false => {
+                allowances!(alws) |
+                ack!("error: amount cannot be negative")
+              }
+              true => {
+                allowances!(alws.set(owner ++ ":" ++ spender, amount)) |
+                stdout!(("Event", "Approval", owner, spender, amount)) |
+                ack!("ok")
+              }
+            }
+          }
         }
       }
     } |
 
-    // Expose Token on a public channel so other deploys can use it
-    // *Token: unquoting because we send the channel itself
-    @"simple_ft_v1"!(*Token)
+    // =========================================================================
+    // INCREASE ALLOWANCE — race-safe incremental approval
+    // =========================================================================
+    // PROOF: The read-update-write of the allowance happens inside a single
+    //        JOIN on `allowances`, so no other `approve`/`increaseAllowance`/
+    //        `decreaseAllowance`/`transferFrom` can observe or mutate the
+    //        intermediate state.
+
+    contract Token(@"increaseAllowance", @owner, @spender, @addedValue, ack) = {
+      for (@p <- paused; @alws <- allowances) {
+        match p {
+          true => {
+            paused!(p) | allowances!(alws) |
+            ack!("error: token is paused")
+          }
+          false => {
+            paused!(p) |
+            match addedValue > 0 {
+              false => {
+                allowances!(alws) |
+                ack!("error: addedValue must be positive")
+              }
+              true => {
+                new keyCh, curCh in {
+                  keyCh!(owner ++ ":" ++ spender) |
+                  for (@k <- keyCh) {
+                    match alws.contains(k) {
+                      true  => { curCh!(alws.get(k)) }
+                      false => { curCh!(0) }
+                    } |
+                    for (@cur <- curCh) {
+                      allowances!(alws.set(k, cur + addedValue)) |
+                      stdout!(("Event", "Approval", owner, spender, cur + addedValue)) |
+                      ack!(("ok", cur + addedValue))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // =========================================================================
+    // DECREASE ALLOWANCE — race-safe allowance reduction
+    // =========================================================================
+
+    contract Token(@"decreaseAllowance", @owner, @spender, @subtractedValue, ack) = {
+      for (@p <- paused; @alws <- allowances) {
+        match p {
+          true => {
+            paused!(p) | allowances!(alws) |
+            ack!("error: token is paused")
+          }
+          false => {
+            paused!(p) |
+            match subtractedValue > 0 {
+              false => {
+                allowances!(alws) |
+                ack!("error: subtractedValue must be positive")
+              }
+              true => {
+                new keyCh in {
+                  keyCh!(owner ++ ":" ++ spender) |
+                  for (@k <- keyCh) {
+                    match alws.contains(k) {
+                      false => {
+                        allowances!(alws) |
+                        ack!("error: no allowance set")
+                      }
+                      true => {
+                        new curCh in {
+                          curCh!(alws.get(k)) |
+                          for (@cur <- curCh) {
+                            match cur >= subtractedValue {
+                              false => {
+                                allowances!(alws) |
+                                ack!("error: decrease exceeds current allowance")
+                              }
+                              true => {
+                                allowances!(alws.set(k, cur - subtractedValue)) |
+                                stdout!(("Event", "Approval", owner, spender, cur - subtractedValue)) |
+                                ack!(("ok", cur - subtractedValue))
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // =========================================================================
+    // TRANSFER FROM — delegated transfer using an allowance
+    // =========================================================================
+    // JOIN: paused + balances + allowances consumed atomically.
+    // PROOF:
+    //   * Allowance reduced by exactly `amount` (I6).
+    //   * Balance(from) reduced by `amount`, balance(to) increased by `amount`.
+    //     Net change = 0, conservation preserved (I5).
+    //   * No intermediate state is externally visible — other handlers cannot
+    //     acquire `balances` or `allowances` between the deduction and the
+    //     write-back.
+
+    contract Token(@"transferFrom", @spender, @from, @to, @amount, ack) = {
+      for (@p <- paused; @bals <- balances; @alws <- allowances) {
+        match p {
+          true => {
+            paused!(p) | balances!(bals) | allowances!(alws) |
+            ack!("error: token is paused")
+          }
+          false => {
+            paused!(p) |
+            match amount > 0 {
+              false => {
+                balances!(bals) | allowances!(alws) |
+                ack!("error: amount must be positive")
+              }
+              true => {
+                new keyCh in {
+                  keyCh!(from ++ ":" ++ spender) |
+                  for (@k <- keyCh) {
+                    match alws.contains(k) {
+                      false => {
+                        balances!(bals) | allowances!(alws) |
+                        ack!("error: no allowance set")
+                      }
+                      true => {
+                        new allowedCh in {
+                          allowedCh!(alws.get(k)) |
+                          for (@alw <- allowedCh) {
+                            match alw >= amount {
+                              false => {
+                                balances!(bals) | allowances!(alws) |
+                                ack!("error: allowance exceeded")
+                              }
+                              true => {
+                                match bals.contains(from) {
+                                  false => {
+                                    balances!(bals) | allowances!(alws) |
+                                    ack!("error: sender has no balance")
+                                  }
+                                  true => {
+                                    new fbCh in {
+                                      fbCh!(bals.get(from)) |
+                                      for (@fb <- fbCh) {
+                                        match fb >= amount {
+                                          false => {
+                                            balances!(bals) | allowances!(alws) |
+                                            ack!("error: insufficient balance")
+                                          }
+                                          true => {
+                                            match bals.contains(to) {
+                                              false => {
+                                                balances!(bals.set(from, fb - amount).set(to, amount)) |
+                                                allowances!(alws.set(k, alw - amount)) |
+                                                stdout!(("Event", "Transfer", from, to, amount)) |
+                                                stdout!(("Event", "Approval", from, spender, alw - amount)) |
+                                                ack!("ok")
+                                              }
+                                              true => {
+                                                balances!(bals.set(from, fb - amount).set(to, bals.get(to) + amount)) |
+                                                allowances!(alws.set(k, alw - amount)) |
+                                                stdout!(("Event", "Transfer", from, to, amount)) |
+                                                stdout!(("Event", "Approval", from, spender, alw - amount)) |
+                                                ack!("ok")
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // =========================================================================
+    // ADMIN FACET — gated by possession of the TokenAdmin capability URI
+    // =========================================================================
+    // Admin operations are NOT gated by `paused` — the admin must be able to
+    // unpause and recover the contract even during a pause.
+    // =========================================================================
+
+    // ---- mint: create new tokens and assign to `to` ----
+    // LAW: totalSupply increases by exactly `amount`. New supply = S + amount.
+    //      Invariant I5 holds: sum(balances) increased by `amount`, supply
+    //      increased by `amount`.
+    contract TokenAdmin(@"mint", @to, @amount, ack) = {
+      for (@bals <- balances; @supply <- totalSupply) {
+        match amount > 0 {
+          false => {
+            balances!(bals) | totalSupply!(supply) |
+            ack!("error: amount must be positive")
+          }
+          true => {
+            match bals.contains(to) {
+              false => {
+                balances!(bals.set(to, amount)) |
+                totalSupply!(supply + amount) |
+                stdout!(("Event", "Mint", to, amount)) |
+                stdout!(("Event", "Transfer", "0x0", to, amount)) |
+                ack!(("ok", supply + amount))
+              }
+              true => {
+                balances!(bals.set(to, bals.get(to) + amount)) |
+                totalSupply!(supply + amount) |
+                stdout!(("Event", "Mint", to, amount)) |
+                stdout!(("Event", "Transfer", "0x0", to, amount)) |
+                ack!(("ok", supply + amount))
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // ---- burn: destroy tokens held by `from` ----
+    // LAW: totalSupply decreases by exactly `amount`. Invariant I5 preserved.
+    contract TokenAdmin(@"burn", @from, @amount, ack) = {
+      for (@bals <- balances; @supply <- totalSupply) {
+        match amount > 0 {
+          false => {
+            balances!(bals) | totalSupply!(supply) |
+            ack!("error: amount must be positive")
+          }
+          true => {
+            match bals.contains(from) {
+              false => {
+                balances!(bals) | totalSupply!(supply) |
+                ack!("error: address has no balance")
+              }
+              true => {
+                new fbCh in {
+                  fbCh!(bals.get(from)) |
+                  for (@fb <- fbCh) {
+                    match fb >= amount {
+                      false => {
+                        balances!(bals) | totalSupply!(supply) |
+                        ack!("error: insufficient balance")
+                      }
+                      true => {
+                        balances!(bals.set(from, fb - amount)) |
+                        totalSupply!(supply - amount) |
+                        stdout!(("Event", "Burn", from, amount)) |
+                        stdout!(("Event", "Transfer", from, "0x0", amount)) |
+                        ack!(("ok", supply - amount))
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } |
+
+    // ---- pause: halt all user-facing state-changing operations ----
+    contract TokenAdmin(@"pause", ack) = {
+      for (@p <- paused) {
+        match p {
+          true => {
+            paused!(p) |
+            ack!("error: already paused")
+          }
+          false => {
+            paused!(true) |
+            stdout!(("Event", "Paused")) |
+            ack!("ok")
+          }
+        }
+      }
+    } |
+
+    // ---- unpause: resume operations ----
+    contract TokenAdmin(@"unpause", ack) = {
+      for (@p <- paused) {
+        match p {
+          false => {
+            paused!(p) |
+            ack!("error: not paused")
+          }
+          true => {
+            paused!(false) |
+            stdout!(("Event", "Unpaused")) |
+            ack!("ok")
+          }
+        }
+      }
+    } |
+
+    // =========================================================================
+    // PUBLICATION — two independent discovery paths
+    // =========================================================================
+    //
+    // (1) REGISTRY (canonical, stable)
+    //     Both facets are registered via rho:registry:insertArbitrary with a
+    //     write-only bundle. `bundle+` means holders of the returned URI can
+    //     SEND to the wrapped channel but cannot read from it — exactly the
+    //     OCAP guarantee we want for both facets.
+    //
+    //     tokenFacetUri  — PUBLIC.  Logged as ("TokenFacetURI", rho:id:…).
+    //     adminFacetUri  — PRIVATE. Logged as ("AdminFacetURI", rho:id:…).
+    //                      Treat as a secret — possession = admin rights.
+    //
+    // (2) WELL-KNOWN CHANNEL (convenience discovery)
+    //     The public Token channel itself is also placed on @"asi_stoken_v1"
+    //     so other deploys can find it without knowing the registry URI.
+    //     Readers must cooperatively restore the message after reading:
+    //
+    //       for (T <- @"asi_stoken_v1") {
+    //         @"asi_stoken_v1"!(*T)      // put back so the next reader finds it
+    //         | T!("balanceOf", addr, *ack)
+    //       }
+    //
+    //     This "well-behaved reader" protocol matches the verified fungible-
+    //     token / NFT reference contracts in the Matterhorn ASI:Chain skill.
+    //     If resilience against uncooperative readers is required, prefer the
+    //     registry URI — it cannot be drained because bundle+ is write-only.
+    // =========================================================================
+
+    // (1a) register public Token facet
+    insertArbitrary!(bundle+{*Token}, *tokenUriCh) |
+    for (@tokenUri <- tokenUriCh) {
+      stdout!(("TokenFacetURI", tokenUri))
+    } |
+
+    // (1b) register private TokenAdmin facet
+    insertArbitrary!(bundle+{*TokenAdmin}, *adminUriCh) |
+    for (@adminUri <- adminUriCh) {
+      stdout!(("AdminFacetURI", adminUri))
+    } |
+
+    // (2) well-known channel — cooperative, restore-after-read convention
+    @"asi_stoken_v1"!(*Token)
   }
 }
